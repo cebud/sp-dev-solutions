@@ -3,7 +3,7 @@ import 'core-js/modules/es6.string.includes.js';
 import 'core-js/modules/es6.number.is-nan.js';
 import * as Handlebars from 'handlebars';
 import { ISearchResult } from '../../models/ISearchResult';
-import { isEmpty, uniqBy, uniq } from '@microsoft/sp-lodash-subset';
+import { isEmpty, uniqBy, uniq, trimEnd } from '@microsoft/sp-lodash-subset';
 import * as strings from 'SearchResultsWebPartStrings';
 import { Text } from '@microsoft/sp-core-library';
 import { DomHelper } from '../../helpers/DomHelper';
@@ -15,10 +15,27 @@ import { IPreviewContainerProps, PreviewType } from './PreviewContainer/IPreview
 
 abstract class BaseTemplateService {
     public CurrentLocale = "en";
+    public TimeZoneBias = {
+        WebBias: 0,
+        UserBias: 0,
+        WebDST: 0,
+        UserDST: 0
+    };
+    private DayLightSavings = true;
 
     constructor() {
         // Registers all helpers
         this.registerTemplateServices();
+        
+        this.DayLightSavings = this.isDST();
+    }
+
+    private isDST(){
+        let today = new Date();
+        var jan = new Date(today.getFullYear(), 0, 1);
+        var jul = new Date(today.getFullYear(), 6, 1);
+        let stdTimeZoneOffset = Math.max(jan.getTimezoneOffset(), jul.getTimezoneOffset());
+        return today.getTimezoneOffset() < stdTimeZoneOffset;
     }
 
     private async LoadHandlebarsHelpers() {
@@ -87,6 +104,48 @@ abstract class BaseTemplateService {
     }
 
     /**
+     * Gets the template HTML markup in the full template content
+     * @param templateContent the full template content
+     */
+    public static getTemplateMarkup(templateContent: string): string {
+
+        const domParser = new DOMParser();
+        const htmlContent: Document = domParser.parseFromString(templateContent, 'text/html');
+
+        let templates: any = htmlContent.getElementById('template');
+        if (templates && templates.innerHTML) {
+
+            // Need to unescape '&gt;' for handlebars partials 
+            return templates.innerHTML.replace('&gt;', '>');
+        } else {
+            return templateContent;
+        }
+    }
+
+    /**
+     * Gets the placeholder HTML markup in the full template content
+     * @param templateContent the full template content
+     */
+    public static getPlaceholderMarkup(templateContent: string): string {
+        const domParser = new DOMParser();
+        const htmlContent: Document = domParser.parseFromString(templateContent, 'text/html');
+
+        const placeHolders = htmlContent.getElementById('placeholder');
+        if (placeHolders && placeHolders.innerHTML) {
+            return placeHolders.innerHTML;
+        } else {
+            return null;
+        }
+    }
+
+    private addMinutes(date: Date, minutes: number, dst: number) {
+        if (this.DayLightSavings) {
+            minutes += dst;
+        }
+        return new Date(date.getTime() + minutes * 60000);
+    }
+
+    /**
      * Registers useful helpers for search results templates
      */
     private registerTemplateServices() {
@@ -132,10 +191,27 @@ abstract class BaseTemplateService {
 
         // Return the formatted date according to current locale using moment.js
         // <p>{{getDate Created "LL"}}</p>
-        Handlebars.registerHelper("getDate", (date: string, format: string) => {
+        Handlebars.registerHelper("getDate", (date: string, format: string, timeHandling?: number) => {
             try {
-                let d = (<any>window).searchHBHelper.moment(date, format, { lang: this.CurrentLocale, datejs: false });
-                return d;
+                let itemDate = new Date(date);
+                if (itemDate.toISOString() !== new Date(null).toISOString()) {
+                    if (typeof timeHandling === "number") {
+                        if (timeHandling === 1) { // show as Z in UI
+                            date = trimEnd(date, "Z");
+                        } else if (timeHandling === 2) { // strip time part
+                            let idx = date.indexOf('T');
+                            date = date.substr(0, idx) + "T00:00:00"; 
+                        } else if (timeHandling === 3) { // show as web region
+                            date = this.addMinutes(itemDate, -this.TimeZoneBias.WebBias, -this.TimeZoneBias.WebDST).toISOString();
+                            date = trimEnd(date, "Z");
+                        } else if (timeHandling === 4 && this.TimeZoneBias.UserBias) { // show as user region if any
+                            date = this.addMinutes(itemDate, -this.TimeZoneBias.UserBias, -this.TimeZoneBias.UserDST).toISOString();
+                            date = trimEnd(date, "Z");
+                        }
+                    }
+                    let d = (<any>window).searchHBHelper.moment(date, format, { lang: this.CurrentLocale, datejs: false });
+                    return d;
+                }
             } catch (error) {
                 return date;
             }
@@ -172,6 +248,16 @@ abstract class BaseTemplateService {
                 result = uniq(array);
             }
             return result.length;
+        });
+
+        // Repeat the block N times
+        // https://stackoverflow.com/questions/11924452/iterating-over-basic-for-loop-using-handlebars-js
+        // <p>{{#times 10}}</p>
+        Handlebars.registerHelper('times', (n, block) => {
+            var accum = '';
+            for (var i = 0; i < n; ++i)
+                accum += block.fn(i);
+            return accum;
         });
     }
 
@@ -336,7 +422,7 @@ abstract class BaseTemplateService {
         for (let i = 0; i < handlebarFunctionNames.length; i++) {
             const element = handlebarFunctionNames[i];
 
-            let regEx = new RegExp("{{#.*?" + element + ".*?}}", "m");
+            let regEx = new RegExp("{{#?.*?" + element + ".*?}}", "m");
             if (regEx.test(templateContent)) {
                 await this.LoadHandlebarsHelpers();
                 break;
@@ -345,7 +431,7 @@ abstract class BaseTemplateService {
 
         let template = Handlebars.compile(templateContent);
         let result = template(templateContext);
-        if (result.indexOf("-preview-item") !== -1) {
+        if (result.indexOf("video-preview-item") !== -1) {
             await this._loadVideoLibrary();
         }
 
@@ -456,15 +542,15 @@ abstract class BaseTemplateService {
                 if (url) {
                     let renderElement = React.createElement(
                         PreviewContainer,
-                        {   
-                            elementUrl: url.replace('interactivepreview','embedview'),
+                        {
+                            elementUrl: url.replace('interactivepreview', 'embedview'),
                             targetElement: thumbnailElt,
                             previewImageUrl: previewImgUrl,
                             showPreview: true,
                             previewType: PreviewType.Document
-                        } as IPreviewContainerProps  
+                        } as IPreviewContainerProps
                     );
-                       
+
                     ReactDom.render(renderElement, el);
                 }
             });
@@ -474,14 +560,13 @@ abstract class BaseTemplateService {
     private async _loadVideoLibrary() {
         // Load Videos-Js on Demand 
         // Webpack will create a other bundle loaded on demand just for this library
-        if ((<any>window).searchVideoJS !== undefined) {
-            return;
+        if ((<any>window).searchVideoJS === undefined) {
+            const videoJs = await import(
+                /* webpackChunkName: 'videos-js' */
+                './video-js'
+            );
+            (<any>window).searchVideoJS = videoJs.default.getVideoJs();
         }
-        const videoJs = await import(
-            /* webpackChunkName: 'videos-js' */
-            './video-js'
-        );
-        (<any>window).searchVideoJS = videoJs.default.getVideoJs();
     }
 
     private _initVideoPreviews() {
@@ -500,7 +585,7 @@ abstract class BaseTemplateService {
                 if (url && fileExtension) {
                     let renderElement = React.createElement(
                         PreviewContainer,
-                        {   
+                        {
                             videoProps: {
                                 fileExtension: fileExtension
                             },
@@ -508,12 +593,12 @@ abstract class BaseTemplateService {
                             targetElement: thumbnailElt,
                             previewImageUrl: previewImgUrl,
                             elementUrl: url,
-                            previewType: PreviewType.Video                            
-                        } as IPreviewContainerProps  
+                            previewType: PreviewType.Video
+                        } as IPreviewContainerProps
                     );
-                       
+
                     ReactDom.render(renderElement, el);
-                }               
+                }
             });
         }));
     }

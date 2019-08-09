@@ -30,6 +30,7 @@ class SearchService implements ISearchService {
     private _refiners: IRefinerConfiguration[];
     private _refinementFilters: IRefinementFilter[];
     private _synonymTable: ISynonymTable;
+    private _queryCulture: number;
 
     public get resultsCount(): number { return this._resultsCount; }
     public set resultsCount(value: number) { this._resultsCount = value; }
@@ -57,6 +58,9 @@ class SearchService implements ISearchService {
 
     public set synonymTable(value: ISynonymTable) { this._synonymTable = value; }
     public get synonymTable(): ISynonymTable { return this._synonymTable; }
+
+    public get queryCulture(): number { return this._queryCulture; }
+    public set queryCulture(value: number) { this._queryCulture = value; }
 
     private _localPnPSetup: SPRest;
 
@@ -123,6 +127,11 @@ class SearchService implements ISearchService {
         searchQuery.TrimDuplicates = false;
         searchQuery.SortList = this._sortList ? this._sortList : [];
 
+        // https://docs.microsoft.com/en-us/previous-versions/office/sharepoint-csom/jj262828(v%3Doffice.15)
+        if (this._queryCulture) {
+            searchQuery.Culture = this._queryCulture;
+        }
+
         if (this.refiners) {
             // Get the refiners order specified in the property pane
             sortedRefiners = this.refiners.map(e => e.refinerName);
@@ -151,7 +160,6 @@ class SearchService implements ISearchService {
                 this._initialSearchResult = await this._localPnPSetup.search(searchQuery);
             }
 
-            const allItemsPromises: Promise<any>[] = [];
             let refinementResults: IRefinementResult[] = [];
 
             // Need to do this check
@@ -182,31 +190,21 @@ class SearchService implements ISearchService {
                 }
 
                 // Map search results
-                resultRows.map((elt) => {
+                let searchResults: ISearchResult[] = resultRows.map((elt) => {
 
-                    const p1 = new Promise<ISearchResult>((resolvep1, rejectp1) => {
+                    // Build item result dynamically
+                    // We can't type the response here because search results are by definition too heterogeneous so we treat them as key-value object
+                    let result: ISearchResult = {};
 
-                        // Build item result dynamically
-                        // We can't type the response here because search results are by definition too heterogeneous so we treat them as key-value object
-                        let result: ISearchResult = {};
-
-                        elt.Cells.map((item) => {
-                            result[item.Key] = item.Value;
-                        });
-
-                        // Get the icon source URL
-                        this._mapToIcon(result.Filename ? result.Filename : Text.format('.{0}', result.FileExtension)).then((iconUrl) => {
-
-                            result.iconSrc = iconUrl;
-                            resolvep1(result);
-
-                        }).catch((error) => {
-                            rejectp1(error);
-                        });
+                    elt.Cells.map((item) => {
+                        result[item.Key] = item.Value;
                     });
 
-                    allItemsPromises.push(p1);
+                    return result;
                 });
+
+                // Map results icon (using batch)
+                searchResults = await this._mapToIcons(searchResults);
 
                 // Map refinement results                    
                 refinementRows.map((refiner) => {
@@ -251,9 +249,6 @@ class SearchService implements ISearchService {
                     results.PromotedResults = promotedResults;
                 }
 
-                // Resolve all the promises once to get news
-                const relevantResults: ISearchResult[] = await Promise.all(allItemsPromises);
-
                 // Sort refiners according to the property pane value
                 refinementResults = sortBy(refinementResults, (refinement) => {
 
@@ -261,7 +256,7 @@ class SearchService implements ISearchService {
                     return sortedRefiners.indexOf(refinement.FilterName);
                 });
 
-                results.RelevantResults = relevantResults;
+                results.RelevantResults = searchResults;
                 results.RefinementResults = refinementResults;
                 results.PaginationInformation.TotalRows = this._initialSearchResult.TotalRows;
             }
@@ -332,13 +327,18 @@ class SearchService implements ISearchService {
             // More info here https://blog.mastykarz.nl/inconvenient-content-targeting-user-segments-search-rest-api/
             const rowLimit: string = enableQueryRules ? '1' : '0';
 
-            url = UrlHelper.addOrReplaceQueryStringParam(url, 'querytext', `'${queryText.replace(/'/g, "''")}'`);
+            // See http://www.silver-it.com/node/127 for quotes handling with GET requests
+            url = UrlHelper.addOrReplaceQueryStringParam(url, 'querytext', `'${encodeURIComponent(queryText.replace(/'/g, '\'\''))}'`);
             url = UrlHelper.addOrReplaceQueryStringParam(url, 'rowlimit', rowLimit);
             url = UrlHelper.addOrReplaceQueryStringParam(url, 'querytemplate', `'${vertical.queryTemplate}'`);
             url = UrlHelper.addOrReplaceQueryStringParam(url, 'trimduplicates', "'false'");
             url = UrlHelper.addOrReplaceQueryStringParam(url, 'properties', "'EnableDynamicGroups:true,EnableMultiGeoSearch:true'");
             url = UrlHelper.addOrReplaceQueryStringParam(url, 'clienttype', "'ContentSearchRegular'");
             url = UrlHelper.addOrReplaceQueryStringParam(url, 'enablequeryrules', `${enableQueryRules}`);
+
+            if (this._queryCulture) {
+                url = UrlHelper.addOrReplaceQueryStringParam(url, 'culture', `${this.queryCulture}`);
+            }
 
             if (vertical.resultSourceId) {
                 url = UrlHelper.addOrReplaceQueryStringParam(url, 'sourceid', `'${vertical.resultSourceId}'`);
@@ -380,6 +380,20 @@ class SearchService implements ISearchService {
     }
 
     /**
+     * Gets all available languages for the search query
+     */
+    public async getAvailableQueryLanguages(): Promise<any[]> {
+
+        try {
+            let languages: any = await this._localPnPSetup.web.regionalSettings.installedLanguages.usingCaching().get();
+            return languages.Items;
+
+        } catch (error) {
+            Logger.write('[SearchService._getQueryLanguages()]: Error: ' + error, LogLevel.Error);
+            throw new Error(error);
+        }
+    }
+    /**
      * Gets the current search service properties configuration
      */
     public getConfiguration(): ISearchServiceConfiguration {
@@ -392,31 +406,61 @@ class SearchService implements ISearchService {
             resultsCount: this.resultsCount,
             selectedProperties: this.selectedProperties,
             sortList: this.sortList,
-            synonymTable: this.synonymTable
-        };
+            synonymTable: this.synonymTable,
+            queryCulture: this.queryCulture
+        } as ISearchServiceConfiguration;
     }
 
     /**
-     * Gets the icon corresponding to the file name extension
-     * @param filename The file name (ex: file.pdf)
+     * Gets the icons corresponding to the result file name extensions
+     * @param searchResults The raw search results
      */
-    private async _mapToIcon(filename: string): Promise<string> {
-
-        const webAbsoluteUrl = this._pageContext.web.absoluteUrl;
+    private async _mapToIcons(searchResults: ISearchResult[]): Promise<ISearchResult[]> {
 
         try {
-            let encodedFileName = filename ? filename.replace(/['']/g, '') : '';
-            const queryStringIndex = encodedFileName.indexOf('?');
-            if (queryStringIndex !== -1) { // filename with query string leads to 400 error.
-                encodedFileName = encodedFileName.slice(0, queryStringIndex);
-            }
-            const iconFileName = await this._localPnPSetup.web.mapToIcon(encodeURIComponent(encodedFileName), 1);
-            const iconUrl = webAbsoluteUrl + '/_layouts/15/images/' + iconFileName;
 
-            return iconUrl;
+            let updatedSearchResults = searchResults;
+
+            const batch = this._localPnPSetup.createBatch();   
+            const parser = new JSONParser();     
+            const batchId = Guid.newGuid().toString();
+
+            const promises = searchResults.map(async result => {
+                
+                const filename = result.Filename ? result.Filename : `.${result.FileExtension}`;
+
+                let encodedFileName = filename ? filename.replace(/['']/g, '') : '';
+                const queryStringIndex = encodedFileName.indexOf('?');
+                if (queryStringIndex !== -1) { // filename with query string leads to 400 error.
+                    encodedFileName = encodedFileName.slice(0, queryStringIndex);
+                }
+
+                let url = `${this._pageContext.web.absoluteUrl}/_api/web/maptoicon(filename='${encodeURIComponent(encodedFileName)}', progid='', size=1)`;
+
+                return batch.add(url, 'GET', {
+                    headers: {
+                        Accept: 'application/json; odata=nometadata'
+                    }
+                }, parser, batchId);
+            });
+
+            // Execute the batch
+            await batch.execute();
+
+            const response = await Promise.all(promises);
+
+            response.map((result: any, index: number) => {
+
+                if (result.value) {
+                    const iconUrl = this._pageContext.web.absoluteUrl + '/_layouts/15/images/' + result.value;
+                    updatedSearchResults[index].IconSrc = iconUrl;
+                }
+            });
+
+            return updatedSearchResults;
 
         } catch (error) {
-            Logger.write('[SearchService._mapToIcon()]: Error: ' + error, LogLevel.Error);
+            Logger.write('[SearchService._mapToIcons()]: Error: ' + error, LogLevel.Error);
             throw new Error(error);
         }
     }
